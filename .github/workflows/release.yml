@@ -223,16 +223,47 @@ jobs:
       (github.event_name == 'pull_request' && github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'release'))
 
     runs-on: ubuntu-latest
+    container:
+      image: almalinux:9
 
     permissions:
       contents: read
 
     steps:
+      - name: Install system packages
+        run: |
+          set -euo pipefail
+          dnf -y install \
+            bash \
+            binutils \
+            file \
+            findutils \
+            gcc \
+            gcc-c++ \
+            git \
+            git-lfs \
+            gzip \
+            jq \
+            make \
+            nodejs \
+            npm \
+            tar \
+            unzip \
+            wget \
+            which \
+            zip
+
       - name: Checkout Repository
         uses: actions/checkout@v6
         with:
           lfs: true
           fetch-depth: 0
+
+      - name: Mark Repository as Safe for Git
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --get-all safe.directory
 
       - name: Setup Go
         uses: actions/setup-go@v6
@@ -248,9 +279,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .git/lfs
-          key: lfs-${{ runner.os }}-${{ hashFiles('.gitattributes') }}
+          key: lfs-${{ runner.os }}-almalinux9-${{ hashFiles('.gitattributes') }}
           restore-keys: |
-            lfs-${{ runner.os }}-
+            lfs-${{ runner.os }}-almalinux9-
 
       - name: Extract dependency versions
         id: deps
@@ -269,15 +300,15 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-almalinux9-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
-            ${{ runner.os }}-go-
+            ${{ runner.os }}-almalinux9-go-
 
       - name: Cache tokenizers library
         uses: actions/cache@v5
         with:
           path: build/tokenizers/libtokenizers.a
-          key: ${{ runner.os }}-tokenizers-v${{ steps.deps.outputs.tokenizers }}-prebuilt-v1
+          key: ${{ runner.os }}-almalinux9-tokenizers-v${{ steps.deps.outputs.tokenizers }}-prebuilt-v1
 
       - name: Cache ONNX Runtime library
         uses: actions/cache@v5
@@ -285,7 +316,7 @@ jobs:
           path: |
             build/libonnxruntime.so.1.24.2
             build/libonnxruntime.so
-          key: ${{ runner.os }}-onnx-1.24.2
+          key: ${{ runner.os }}-almalinux9-onnx-1.24.2
 
       - name: Extract Version
         id: version
@@ -302,6 +333,7 @@ jobs:
 
       - name: Verify Git LFS Files
         run: |
+          set -euo pipefail
           git lfs pull
           # Verify model file is not an LFS pointer
           MODEL_SIZE=$(stat -c%s "model/quantized/model.onnx" 2>/dev/null || echo "0")
@@ -315,6 +347,21 @@ jobs:
         run: |
           chmod +x src/scripts/build_linux.sh
           ./src/scripts/build_linux.sh
+
+      - name: Report GLIBC requirements
+        run: |
+          chmod +x src/scripts/report_glibc_requirements.sh
+          GLIBC_REPORT="$(
+            ./src/scripts/report_glibc_requirements.sh \
+              build/kiji-proxy \
+              build/libonnxruntime.so.1.24.2
+          )"
+          echo "$GLIBC_REPORT"
+
+          GLIBC_REQUIREMENT="$(printf '%s\n' "$GLIBC_REPORT" | awk -F': ' '/^Release minimum required GLIBC:/ {print $2}' | tail -n 1)"
+          if [ -n "$GLIBC_REQUIREMENT" ]; then
+            echo "**Minimum required GLIBC:** $GLIBC_REQUIREMENT" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload Linux Archive as Artifact
         uses: actions/upload-artifact@v7
