@@ -679,9 +679,6 @@ function updateTrayMenu() {
       },
     },
 
-    // TODO: Add link to https://chromewebstore.google.com/detail/kiji-privacy-proxy-extens/knnjemahdeioghdgcpeikepmlajfihin?hl=en-US&utm_source=ext_sidebar&pli=1
-    //
-
     { type: "separator" },
     {
       label: "Terms && Conditions",
