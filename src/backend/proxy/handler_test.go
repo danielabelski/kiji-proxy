@@ -22,12 +22,14 @@ import (
 
 // mockDetector implements pii.Detector for testing without ONNX model
 type mockDetector struct {
-	entities []pii.Entity
+	entities    []pii.Entity
+	entityTypes []string
 }
 
 func (d *mockDetector) GetName() string                        { return "mock" }
 func (d *mockDetector) Close() error                           { return nil }
 func (d *mockDetector) SetEntityConfidenceThreshold(_ float64) {}
+func (d *mockDetector) EntityTypes() []string                  { return d.entityTypes }
 func (d *mockDetector) Detect(_ context.Context, input pii.DetectorInput) (pii.DetectorOutput, error) {
 	return pii.DetectorOutput{
 		Text:     input.Text,
@@ -985,5 +987,77 @@ func TestHandler_MaskPIIInText_NoPII(t *testing.T) {
 	}
 	if len(entities) != 0 {
 		t.Errorf("expected empty entities, got %v", entities)
+	}
+}
+
+func TestHandler_MaskPIIInText_DisabledEntityPassesThrough(t *testing.T) {
+	// "John a@b.com": FIRSTNAME at [0,4), EMAIL at [5,12).
+	detector := &mockDetector{
+		entities: []pii.Entity{
+			{Text: "John", Label: "FIRSTNAME", StartPos: 0, EndPos: 4, Confidence: 0.95},
+			{Text: "a@b.com", Label: "EMAIL", StartPos: 5, EndPos: 12, Confidence: 0.95},
+		},
+		entityTypes: []string{"EMAIL", "FIRSTNAME"},
+	}
+	h := newTestHandler(t, detector, nil)
+
+	// Disable EMAIL only; it must pass through unmasked while FIRSTNAME is masked.
+	h.SetDisabledEntities([]string{"EMAIL"})
+
+	maskedText, mapping, entities := h.maskPIIInText("John a@b.com", "[test]")
+
+	if len(entities) != 1 || entities[0].Label != "FIRSTNAME" {
+		t.Fatalf("expected only the FIRSTNAME entity, got %+v", entities)
+	}
+	if !strings.Contains(maskedText, "a@b.com") {
+		t.Errorf("expected disabled EMAIL to pass through unmasked, got %q", maskedText)
+	}
+	if strings.Contains(maskedText, "John") {
+		t.Errorf("expected FIRSTNAME to be masked, got %q", maskedText)
+	}
+	if len(mapping) != 1 {
+		t.Errorf("expected exactly one masked->original mapping, got %v", mapping)
+	}
+}
+
+func TestHandler_MaskPIIInText_EmptyDisabledMasksAll(t *testing.T) {
+	// The fail-closed property: an empty exclusion list masks everything, so an
+	// accidental cleared selection never leaks PII.
+	detector := &mockDetector{
+		entities: []pii.Entity{
+			{Text: "John", Label: "FIRSTNAME", StartPos: 0, EndPos: 4, Confidence: 0.95},
+		},
+		entityTypes: []string{"FIRSTNAME"},
+	}
+	h := newTestHandler(t, detector, nil)
+
+	h.SetDisabledEntities([]string{}) // explicit empty => mask everything
+
+	maskedText, mapping, entities := h.maskPIIInText("John here", "[test]")
+
+	if strings.Contains(maskedText, "John") {
+		t.Errorf("expected FIRSTNAME to be masked when nothing is disabled, got %q", maskedText)
+	}
+	if len(mapping) != 1 || len(entities) != 1 {
+		t.Errorf("expected one entity masked, got mapping=%v entities=%v", mapping, entities)
+	}
+}
+
+func TestHandler_EntityTypeAccessors(t *testing.T) {
+	detector := &mockDetector{entityTypes: []string{"EMAIL", "FIRSTNAME"}}
+	h := newTestHandler(t, detector, nil)
+
+	available, err := h.GetAvailableEntityTypes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(available) != 2 || available[0] != "EMAIL" || available[1] != "FIRSTNAME" {
+		t.Errorf("unexpected available types: %v", available)
+	}
+
+	// With no explicit selection, nothing is disabled (everything is masked).
+	disabled := h.GetDisabledEntities()
+	if len(disabled) != 0 {
+		t.Errorf("expected no disabled entities by default, got %v", disabled)
 	}
 }

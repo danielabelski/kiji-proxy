@@ -93,6 +93,18 @@ interface ElectronAPI {
     confidence: number
   ) => Promise<{ success: boolean; error?: string }>;
 
+  // PII entities to mask. The stored value is the exclusion list (types left
+  // unmasked); empty means "mask everything".
+  getAvailableEntities: () => Promise<{
+    available?: string[];
+    disabled?: string[];
+    error?: string;
+  }>;
+  getDisabledEntities: () => Promise<string[] | null>;
+  setDisabledEntities: (
+    entities: string[]
+  ) => Promise<{ success: boolean; error?: string }>;
+
   // Platform and version info
   platform: string;
   versions: {

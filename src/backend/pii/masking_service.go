@@ -5,6 +5,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 
 	detectors "github.com/hannes/kiji-private/src/backend/pii/detectors"
 )
@@ -32,6 +33,16 @@ type MaskingService struct {
 	detectorProvider DetectorProvider
 	generator        *GeneratorService
 	mapping          *PIIMapping // optional persistent original<->dummy store; nil disables reuse
+
+	// disabledEntities is the set of base entity labels the user has chosen NOT
+	// to mask (they pass through to the provider unchanged). This is an exclusion
+	// list on purpose: a nil or empty set means "nothing is excluded, mask
+	// everything", so the default — and any accidental clearing of the
+	// selection — fails closed toward masking rather than leaking PII. Guarded by
+	// mu so it can be updated at runtime via the settings API without recreating
+	// the service (the selection therefore survives model hot-reloads).
+	mu               sync.RWMutex
+	disabledEntities map[string]struct{}
 }
 
 // NewMaskingService creates a new masking service.
@@ -66,6 +77,11 @@ func (s *MaskingService) MaskText(text string, logPrefix string) MaskedResult {
 			Entities:         []detectors.Entity{},
 		}
 	}
+
+	// Drop entities whose type the user has disabled. Disabled types pass through
+	// unmasked. This runs before any masking so both the masked text and the
+	// returned Entities reflect only the active selection.
+	piiFound.Entities = s.filterDisabledEntities(piiFound.Entities)
 
 	if len(piiFound.Entities) == 0 {
 		log.Printf("%s No PII detected", logPrefix)
@@ -155,6 +171,68 @@ func (s *MaskingService) MaskText(text string, logPrefix string) MaskedResult {
 		MaskedToOriginal: maskedToOriginal,
 		Entities:         entities,
 	}
+}
+
+// filterDisabledEntities removes entities whose base label the user has disabled
+// (those pass through unmasked). An empty exclusion set means "nothing is
+// disabled", so everything is masked — the fail-closed default.
+func (s *MaskingService) filterDisabledEntities(entities []detectors.Entity) []detectors.Entity {
+	s.mu.RLock()
+	disabled := s.disabledEntities
+	s.mu.RUnlock()
+
+	if len(disabled) == 0 {
+		return entities
+	}
+
+	filtered := make([]detectors.Entity, 0, len(entities))
+	for _, e := range entities {
+		if _, ok := disabled[e.Label]; !ok {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
+}
+
+// SetDisabledEntities sets the labels to leave unmasked. An empty (or nil) slice
+// clears the exclusion list, which means "mask everything" — so an accidental
+// empty selection fails closed toward masking rather than leaking PII.
+func (s *MaskingService) SetDisabledEntities(labels []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(labels) == 0 {
+		s.disabledEntities = nil
+		return
+	}
+	set := make(map[string]struct{}, len(labels))
+	for _, label := range labels {
+		set[label] = struct{}{}
+	}
+	s.disabledEntities = set
+}
+
+// GetDisabledEntities returns the sorted set of labels currently left unmasked.
+// An empty result means everything is masked.
+func (s *MaskingService) GetDisabledEntities() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	labels := make([]string, 0, len(s.disabledEntities))
+	for label := range s.disabledEntities {
+		labels = append(labels, label)
+	}
+	sort.Strings(labels)
+	return labels
+}
+
+// GetAvailableEntityTypes returns the maximum set of selectable entity labels,
+// sourced from the currently loaded model.
+func (s *MaskingService) GetAvailableEntityTypes() ([]string, error) {
+	detector, err := s.detectorProvider.GetDetector()
+	if err != nil {
+		return nil, err
+	}
+	return detector.EntityTypes(), nil
 }
 
 // RestorePII restores masked PII text back to original text using the stored mapping

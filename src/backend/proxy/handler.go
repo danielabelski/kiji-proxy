@@ -76,6 +76,31 @@ func (h *Handler) GetEntityConfidenceThreshold() float64 {
 	return h.modelManager.GetEntityConfidenceThreshold()
 }
 
+// SetDisabledEntities updates which entity types are left unmasked. An empty
+// list clears the exclusion (mask everything).
+func (h *Handler) SetDisabledEntities(labels []string) {
+	if h.maskingService != nil {
+		h.maskingService.SetDisabledEntities(labels)
+	}
+}
+
+// GetDisabledEntities returns the entity types currently left unmasked.
+func (h *Handler) GetDisabledEntities() []string {
+	if h.maskingService == nil {
+		return []string{}
+	}
+	return h.maskingService.GetDisabledEntities()
+}
+
+// GetAvailableEntityTypes returns the full set of entity types the loaded model
+// can detect (the maximum selectable set).
+func (h *Handler) GetAvailableEntityTypes() ([]string, error) {
+	if h.maskingService == nil {
+		return nil, fmt.Errorf("masking service not initialized")
+	}
+	return h.maskingService.GetAvailableEntityTypes()
+}
+
 // GetModelInfo returns information about the current model state
 func (h *Handler) GetModelInfo() map[string]interface{} {
 	if h.modelManager == nil {

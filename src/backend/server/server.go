@@ -20,6 +20,8 @@ import (
 )
 
 const responseFieldSuccess = "success"
+const responseFieldEnabled = "enabled"
+const responseFieldDisabled = "disabled"
 
 // RateLimiter manages rate limiting for API endpoints
 type RateLimiter struct {
@@ -241,6 +243,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/proxy/transparent/toggle", s.handleTransparentProxyToggle)
 	mux.HandleFunc("/api/pii/check", s.handlePIICheck)
 	mux.HandleFunc("/api/pii/confidence", s.handlePIIConfidence)
+	mux.HandleFunc("/api/pii/entities", s.handlePIIEntities)
 
 	// Add provider endpoints
 	mux.Handle(providers.ProviderSubpathOpenAI, s.handler) // same as Mistral
@@ -370,6 +373,8 @@ func (s *Server) startTransparentProxy() {
 			s.handlePIICheck(w, r)
 		case "/api/pii/confidence":
 			s.handlePIIConfidence(w, r)
+		case "/api/pii/entities":
+			s.handlePIIEntities(w, r)
 		default:
 			// All other HTTP/HTTPS requests go to transparent proxy
 			s.transparentProxy.ServeHTTP(w, r)
@@ -732,6 +737,74 @@ func (s *Server) handlePIIConfidence(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handlePIIEntities handles GET/POST /api/pii/entities requests. GET returns the
+// available entity types (from the loaded model) plus the entity types currently
+// disabled (left unmasked). POST replaces the disabled set with the provided
+// list; an empty list means "mask everything" (fail closed).
+func (s *Server) handlePIIEntities(w http.ResponseWriter, r *http.Request) {
+	s.corsHandler(w, r)
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		available, err := s.handler.GetAvailableEntityTypes()
+		if err != nil {
+			http.Error(w, "Model not available", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
+			"available":           available,
+			responseFieldDisabled: s.handler.GetDisabledEntities(),
+		}); err != nil {
+			log.Printf("Failed to encode PII entities response: %v", err)
+		}
+
+	case http.MethodPost:
+		var req struct {
+			Disabled []string `json:"disabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		// Reject labels the loaded model can't produce so the selection stays
+		// meaningful. If the model is unavailable we skip validation rather than
+		// drop the user's choice.
+		if available, err := s.handler.GetAvailableEntityTypes(); err == nil {
+			valid := make(map[string]struct{}, len(available))
+			for _, label := range available {
+				valid[label] = struct{}{}
+			}
+			for _, label := range req.Disabled {
+				if _, ok := valid[label]; !ok {
+					http.Error(w, "Unknown entity label: "+label, http.StatusBadRequest)
+					return
+				}
+			}
+		}
+
+		s.handler.SetDisabledEntities(req.Disabled)
+		log.Printf("PII disabled (passthrough) entities updated: %d left unmasked", len(req.Disabled))
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
+			responseFieldSuccess:  true,
+			responseFieldDisabled: req.Disabled,
+		}); err != nil {
+			log.Printf("Failed to encode PII entities response: %v", err)
+		}
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 // handleTransparentProxyToggle handles POST /api/proxy/transparent/toggle requests
 func (s *Server) handleTransparentProxyToggle(w http.ResponseWriter, r *http.Request) {
 	s.corsHandler(w, r)
@@ -764,7 +837,7 @@ func (s *Server) handleTransparentProxyToggle(w http.ResponseWriter, r *http.Req
 	w.WriteHeader(http.StatusOK)
 	response := map[string]interface{}{
 		responseFieldSuccess: true,
-		"enabled":            req.Enabled,
+		responseFieldEnabled: req.Enabled,
 	}
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Failed to encode response: %v", err)
