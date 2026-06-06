@@ -138,6 +138,17 @@ func (m *mockMappingDB) DeleteMapping(_ context.Context, original string) error 
 	return nil
 }
 
+// DeleteMappingByID deletes one arbitrary mapping (the mock has no real ids) and
+// returns its original/dummy, or ErrMappingNotFound when empty.
+func (m *mockMappingDB) DeleteMappingByID(_ context.Context, _ int) (string, string, error) {
+	for original, dummy := range m.mappings {
+		delete(m.mappings, original)
+		delete(m.reverse, dummy)
+		return original, dummy, nil
+	}
+	return "", "", piiServices.ErrMappingNotFound
+}
+
 func (m *mockMappingDB) CleanupOldMappings(_ context.Context, _ time.Duration) (int64, error) {
 	return 0, nil
 }
@@ -150,6 +161,17 @@ func (m *mockMappingDB) ClearMappings(_ context.Context) error {
 
 func (m *mockMappingDB) GetMappingsCount(_ context.Context) (int, error) {
 	return len(m.mappings), nil
+}
+
+func (m *mockMappingDB) GetMappings(_ context.Context, _ int, _ int, _ string, _ bool) ([]map[string]interface{}, error) {
+	result := make([]map[string]interface{}, 0, len(m.mappings))
+	for original, dummy := range m.mappings {
+		result = append(result, map[string]interface{}{
+			"original_pii": original,
+			"dummy_pii":    dummy,
+		})
+	}
+	return result, nil
 }
 
 func (m *mockMappingDB) Close() error {
@@ -265,6 +287,7 @@ func newTestHandler(t *testing.T, detector *mockDetector, upstreamServer *httpte
 		maskingService:    maskingService,
 		loggingDB:         loggingDB,
 		mappingDB:         mappingDB,
+		piiMapping:        piiMapping,
 	}
 }
 
