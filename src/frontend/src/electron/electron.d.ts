@@ -62,10 +62,10 @@ interface ElectronAPI {
   setWelcomeDismissed: (
     dismissed: boolean
   ) => Promise<{ success: boolean; error?: string }>;
-  // Tour completed flag
-  getTourCompleted: () => Promise<boolean>;
-  setTourCompleted: (
-    completed: boolean
+  // Admin flag
+  getAdmin: () => Promise<boolean>;
+  setAdmin: (
+    admin: boolean
   ) => Promise<{ success: boolean; error?: string }>;
 
   // Model directory settings
@@ -128,8 +128,6 @@ interface ElectronAPI {
   removeSettingsListener: () => void;
   onAboutOpen: (callback: () => void) => void;
   removeAboutListener: () => void;
-  onTourOpen: (callback: () => void) => void;
-  removeTourListener: () => void;
 }
 
 interface Window {

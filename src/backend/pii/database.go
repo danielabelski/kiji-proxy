@@ -367,8 +367,13 @@ func (s *SQLitePIIMappingDB) GetMappings(ctx context.Context, limit int, offset 
 		}
 
 		// Parse created_at into time.Time so it serializes as RFC3339 for the
-		// frontend (matching how GetLogs returns timestamps).
-		parsedCreated, _ := time.Parse("2006-01-02 15:04:05", createdAt)
+		// frontend (matching how GetLogs returns timestamps). On failure log it
+		// (rather than silently swallowing) and keep the row with the zero time so
+		// the paginated mappings view doesn't drop entries.
+		parsedCreated, err := time.Parse("2006-01-02 15:04:05", createdAt)
+		if err != nil {
+			log.Printf("[SQLiteDB] ⚠️  Mapping row %d has unparseable created_at %q: %v", id, createdAt, err)
+		}
 
 		mappings = append(mappings, map[string]interface{}{
 			"id":                     id,
@@ -512,8 +517,13 @@ func (s *SQLitePIIMappingDB) GetLogs(ctx context.Context, limit int, offset int)
 
 		detectedPIIStr := formatDetectedPII(detectedPII)
 
-		// Parse timestamp
-		parsedTime, _ := time.Parse("2006-01-02 15:04:05", timestamp)
+		// Parse timestamp. On failure log it (rather than silently swallowing) and
+		// fall through with the zero time so the row still shows in the paginated
+		// /logs view instead of being dropped.
+		parsedTime, err := time.Parse("2006-01-02 15:04:05", timestamp)
+		if err != nil {
+			log.Printf("[SQLiteDB] ⚠️  Log row %d has unparseable timestamp %q: %v", id, timestamp, err)
+		}
 
 		logEntry := map[string]interface{}{
 			"id":           id,
@@ -547,6 +557,126 @@ func (s *SQLitePIIMappingDB) GetLogs(ctx context.Context, limit int, offset int)
 	}
 
 	return logs, nil
+}
+
+// MetricsSeedRow is a privacy-safe projection of a logged request, used to seed
+// the dashboard metrics collector at startup. It carries entity *types* and
+// confidences only — never the original PII text or the message body.
+type MetricsSeedRow struct {
+	Timestamp   time.Time
+	Model       string
+	Types       []string
+	Confidences []float64
+}
+
+// MetricsSeedRows returns up to limit most-recent proxied requests (the
+// "request_masked" log rows) projected for metrics seeding. The original PII in
+// detected_pii is intentionally discarded; only the type label and confidence
+// of each entity are read out. Latency is not reconstructed here: the log rows
+// don't record masking time, so seeded requests carry no latency (the live proxy
+// path measures and records the added overhead going forward).
+func (s *SQLitePIIMappingDB) MetricsSeedRows(ctx context.Context, limit int) ([]MetricsSeedRow, error) {
+	rows, err := s.db.QueryContext(ctx, `
+	SELECT timestamp, model, detected_pii
+	FROM logs
+	WHERE direction = 'request_masked'
+	ORDER BY timestamp DESC
+	LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query metrics seed rows: %w", err)
+	}
+	defer rows.Close()
+
+	return scanMetricsSeedRows(rows)
+}
+
+// DashboardWindowRows returns the privacy-safe projection of every proxied
+// ("request_masked") request at or after `since`, ordered oldest first. A zero
+// `since` returns the full history. Unlike MetricsSeedRows it is unbounded and
+// ascending, so the dashboard can bucket it into a dense per-day (or per-hour)
+// timeseries and a composition breakdown computed directly from SQLite rather
+// than from the in-memory collector.
+func (s *SQLitePIIMappingDB) DashboardWindowRows(ctx context.Context, since time.Time) ([]MetricsSeedRow, error) {
+	const base = `
+	SELECT timestamp, model, detected_pii
+	FROM logs
+	WHERE direction = 'request_masked'`
+
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if since.IsZero() {
+		rows, err = s.db.QueryContext(ctx, base+`
+	ORDER BY timestamp ASC`)
+	} else {
+		// Stored timestamps use SQLite datetime('now') (UTC "YYYY-MM-DD HH:MM:SS");
+		// compare against the same fixed-width format so the string compare is
+		// chronological.
+		rows, err = s.db.QueryContext(ctx, base+`
+	AND timestamp >= ?
+	ORDER BY timestamp ASC`, since.UTC().Format("2006-01-02 15:04:05"))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query dashboard window rows: %w", err)
+	}
+	defer rows.Close()
+
+	return scanMetricsSeedRows(rows)
+}
+
+// scanMetricsSeedRows scans rows of (timestamp, model, detected_pii) into the
+// privacy-safe MetricsSeedRow projection. The original PII text in detected_pii
+// is intentionally discarded; only entity types and confidences are read out.
+func scanMetricsSeedRows(rows *sql.Rows) ([]MetricsSeedRow, error) {
+	var out []MetricsSeedRow
+	for rows.Next() {
+		var timestamp string
+		var model sql.NullString
+		var detectedPIIJSON string
+
+		if err := rows.Scan(&timestamp, &model, &detectedPIIJSON); err != nil {
+			return nil, fmt.Errorf("failed to scan metrics seed row: %w", err)
+		}
+
+		var detected []LogEntry
+		if len(detectedPIIJSON) > 0 {
+			if err := json.Unmarshal([]byte(detectedPIIJSON), &detected); err != nil {
+				// Skip a malformed row rather than failing the whole query.
+				continue
+			}
+		}
+
+		types := make([]string, 0, len(detected))
+		confs := make([]float64, 0, len(detected))
+		for _, e := range detected {
+			types = append(types, e.PIIType)
+			confs = append(confs, e.Confidence)
+		}
+
+		parsedTime, err := time.Parse("2006-01-02 15:04:05", timestamp)
+		if err != nil {
+			// Skip a row with an unparseable timestamp rather than letting it
+			// default to the zero time (year 0001). A zero-time row would otherwise
+			// anchor the dashboard's "all"-range window at year 0001 and blow up its
+			// dense per-day bucket loop.
+			log.Printf("[SQLiteDB] ⚠️  Skipping metrics seed row with unparseable timestamp %q: %v", timestamp, err)
+			continue
+		}
+
+		row := MetricsSeedRow{Timestamp: parsedTime, Types: types, Confidences: confs}
+		if model.Valid {
+			row.Model = model.String
+		}
+		out = append(out, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating metrics seed rows: %w", err)
+	}
+
+	return out, nil
 }
 
 // formatDetectedPII formats the detected PII array as a readable string

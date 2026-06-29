@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -8,8 +10,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/dataiku/kiji-proxy/src/backend/config"
@@ -80,8 +85,15 @@ type Server struct {
 	modelFS                 fs.FS
 	rateLimiter             *RateLimiter
 	version                 string
+	startedAt               time.Time // process start; basis for the reported uptime
 	transparentProxyEnabled bool
 	transparentProxyMu      sync.RWMutex
+}
+
+// uptimeSeconds reports how long the server has been running, as a whole-second
+// delta between now and the recorded start time.
+func (s *Server) uptimeSeconds() int64 {
+	return int64(time.Since(s.startedAt).Seconds())
 }
 
 // NewServer creates a new server instance
@@ -122,6 +134,7 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		systemProxyManager:      systemProxyManager,
 		rateLimiter:             rateLimiter,
 		version:                 version,
+		startedAt:               time.Now(),
 		transparentProxyEnabled: cfg.Proxy.TransparentEnabled,
 	}
 
@@ -171,6 +184,7 @@ func NewServerWithEmbedded(cfg *config.Config, uiFS, modelFS fs.FS, version stri
 		modelFS:                 modelFS,
 		rateLimiter:             rateLimiter,
 		version:                 version,
+		startedAt:               time.Now(),
 		transparentProxyEnabled: cfg.Proxy.TransparentEnabled,
 	}
 
@@ -232,11 +246,23 @@ func (s *Server) Start() error {
 
 	// Add admin endpoints (e.g. health check, logs, certs, etc.)
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/health", s.healthCheck)
+	mux.HandleFunc("/api/version", s.versionHandler)
+	mux.HandleFunc("/api/auth/status", s.authStatusHandler)
+	mux.HandleFunc("/api/logs", s.logsHandler)
+	mux.HandleFunc("/api/mappings", s.mappingsHandler)
+	mux.HandleFunc("/api/stats", s.statsHandler)
+
+	// Deprecated: bare admin paths, kept only for backwards compatibility with
+	// already-installed Chrome extensions and older clients that predate the
+	// /api/* convention. All first-party callers now use the /api/* routes
+	// above. TODO: remove these aliases once existing extensions have migrated.
 	mux.HandleFunc("/health", s.healthCheck)
 	mux.HandleFunc("/version", s.versionHandler)
 	mux.HandleFunc("/logs", s.logsHandler)
 	mux.HandleFunc("/mappings", s.mappingsHandler)
 	mux.HandleFunc("/stats", s.statsHandler)
+
 	mux.HandleFunc("/api/model/security", s.handleModelSecurity)
 	mux.HandleFunc("/api/model/reload", s.handleModelReload)
 	mux.HandleFunc("/api/model/info", s.handleModelInfo)
@@ -247,13 +273,21 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/pii/entities", s.handlePIIEntities)
 	mux.HandleFunc("/api/pii/regexes", s.handlePIIRegexes)
 
+	// Dashboard API
+	mux.HandleFunc("/api/dashboard", s.dashboardHandler)
+
 	// Add provider endpoints
 	mux.Handle(providers.ProviderSubpathOpenAI, s.handler) // same as Mistral
 	mux.Handle(providers.ProviderSubpathAnthropic, s.handler)
 	mux.Handle(providers.ProviderSubpathGemini+"/{path...}", s.handler)
 
-	// Serve UI files with cache-busting headers
-	if s.uiFS != nil {
+	// Serve UI files with cache-busting headers. Gated by config.ServeUI
+	// (KIJI_SERVE_UI=false) so the Linux build can run API-only/headless; when
+	// disabled, no "/" handler is registered and the UI paths return 404.
+	switch {
+	case !s.config.ServeUI:
+		log.Println("[DEBUG] UI serving disabled (KIJI_SERVE_UI=false); not registering \"/\" handler")
+	case s.uiFS != nil:
 		log.Println("[DEBUG] Using embedded UI filesystem")
 
 		// List root contents of embedded FS
@@ -294,17 +328,24 @@ func (s *Server) Start() error {
 			uiFS := http.FileServer(http.FS(subFS))
 			mux.Handle("/", s.noCacheMiddleware(uiFS))
 		}
-	} else {
+	default:
 		log.Println("[DEBUG] Using filesystem UI path:", s.config.UIPath)
 		// Use file system
 		uiFS := http.FileServer(http.Dir(s.config.UIPath))
 		mux.Handle("/", s.noCacheMiddleware(uiFS))
 	}
 
+	// Optionally guard the UI + /api/* admin endpoints with HTTP Basic Auth. When
+	// inactive the mux is used as-is, so behavior is unchanged for the desktop build.
+	var rootHandler http.Handler = mux
+	if s.config.BasicAuth.Active() {
+		rootHandler = s.basicAuthMiddleware(mux)
+	}
+
 	// Create server with timeout configuration
 	server := &http.Server{
 		Addr:         s.config.ProxyPort,
-		Handler:      mux,
+		Handler:      rootHandler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -355,18 +396,29 @@ func (s *Server) startTransparentProxy() {
 			return
 		}
 
-		// Route API endpoints
+		// Guard admin/data endpoints with Basic Auth when enabled. CONNECT (above)
+		// and the proxy pass-through (default case below) stay open, so only the
+		// explicitly-listed admin paths are challenged.
+		if s.config.BasicAuth.Active() && isTransparentAdminProtectedPath(r.URL.Path) && !s.validBasicAuth(r) {
+			writeBasicAuthChallenge(w)
+			return
+		}
+
+		// Route API endpoints. Bare paths are deprecated aliases kept for
+		// backwards compatibility; see the main mux registration above.
 		switch r.URL.Path {
-		case "/logs":
+		case "/api/logs", "/logs":
 			s.logsHandler(w, r)
-		case "/health":
+		case "/api/health", "/health":
 			s.healthCheck(w, r)
-		case "/version":
+		case "/api/version", "/version":
 			s.versionHandler(w, r)
-		case "/mappings":
+		case "/api/mappings", "/mappings":
 			s.mappingsHandler(w, r)
-		case "/stats":
+		case "/api/stats", "/stats":
 			s.statsHandler(w, r)
+		case "/api/dashboard":
+			s.dashboardHandler(w, r)
 		case "/api/model/security":
 			s.handleModelSecurity(w, r)
 		case "/api/proxy/ca-cert":
@@ -415,9 +467,10 @@ func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]interface{}{
-		"status":        status,
-		"service":       "Kiji Privacy Proxy Service",
-		"model_healthy": modelHealthy,
+		"status":         status,
+		"service":        "Kiji Privacy Proxy Service",
+		"model_healthy":  modelHealthy,
+		"uptime_seconds": s.uptimeSeconds(),
 	}
 
 	if !modelHealthy {
@@ -451,6 +504,28 @@ func (s *Server) versionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// authStatusHandler reports whether HTTP Basic Auth is configured (a username
+// and password are set and enabled). The web UI uses this as its admin signal:
+// whoever set the credentials and can load the gated UI is the admin. It exposes
+// ONLY this boolean — never the username/password — and stays reachable without
+// Basic Auth (see basicAuthPublicExact) so the UI can query it before/without
+// authenticating.
+func (s *Server) authStatusHandler(w http.ResponseWriter, r *http.Request) {
+	// Add CORS headers
+	s.corsHandler(w, r)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	response := map[string]bool{
+		"basicAuthActive": s.config.BasicAuth.Active(),
+	}
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Failed to write auth status response: %v", err)
+	}
+}
+
 // corsHandler adds CORS headers to the response
 func (s *Server) corsHandler(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
@@ -465,7 +540,7 @@ func (s *Server) corsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, DELETE")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-OpenAI-API-Key")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-OpenAI-API-Key, X-Kiji-Source")
 	w.Header().Set("Access-Control-Max-Age", "3600")
 }
 
@@ -570,9 +645,16 @@ func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleModelSecurity(w http.ResponseWriter, r *http.Request) {
-	// Read model manifest from whichever variant is currently active.
-	manifestPath := filepath.Join(s.config.ResolveModelDirectory(), "model_manifest.json")
-	data, err := os.ReadFile(manifestPath) // #nosec G304 — path derived from validated config
+	// Read the manifest from the directory the model manager actually loaded (it
+	// tracks hot reloads), falling back to the configured directory if the manager
+	// hasn't reported one. Reading the static config path here would report the
+	// original model's manifest after a reload pointed at a different directory.
+	modelDir := s.config.ResolveModelDirectory()
+	if dir, ok := s.handler.GetModelInfo()["directory"].(string); ok && dir != "" {
+		modelDir = dir
+	}
+	manifestPath := filepath.Join(modelDir, "model_manifest.json")
+	data, err := os.ReadFile(manifestPath) // #nosec G304 — path derived from validated config/model manager
 
 	if err != nil {
 		http.Error(w, "Model manifest not found", http.StatusNotFound)
@@ -585,8 +667,15 @@ func (s *Server) handleModelSecurity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Extract hashes.sha256 defensively: a manifest without a "hashes" object (or
+	// without a string sha256) must not panic the handler.
+	var sha256 interface{}
+	if hashes, ok := manifest["hashes"].(map[string]interface{}); ok {
+		sha256 = hashes["sha256"]
+	}
+
 	response := map[string]interface{}{
-		"hash":     manifest["hashes"].(map[string]interface{})["sha256"],
+		"hash":     sha256,
 		"manifest": manifest,
 	}
 
@@ -1021,11 +1110,108 @@ func (s *Server) handleModelInfo(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// StartWithErrorHandling starts the server with proper error handling
+// StartWithErrorHandling starts the server with proper error handling.
+//
+// Start blocks in ListenAndServe, so a process-level SIGTERM/SIGINT would
+// otherwise kill the proxy without ever running Close(). That matters on macOS:
+// Start() enables the system auto-proxy (PAC at localhost:9090) and only
+// Close() tears it back down, so an abrupt exit leaves the machine pointed at a
+// dead PAC server. Install a signal handler that runs the same cleanup as Close
+// before exiting.
 func (s *Server) StartWithErrorHandling() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-sigCh
+		log.Printf("Received signal %v, shutting down and restoring system proxy...", sig)
+		if err := s.Close(); err != nil {
+			log.Printf("Warning: Error during shutdown cleanup: %v", err)
+		}
+		os.Exit(0)
+	}()
+
 	if err := s.Start(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
+}
+
+// basicAuthPublicPrefixes and basicAuthPublicExact list the request paths that
+// stay reachable WITHOUT Basic Auth even when it is enabled: the LLM proxy routes
+// (they carry their own provider API keys), all /api/pii/* endpoints (used by the
+// Chrome extension / API clients), and the lightweight health/version probes used
+// by load balancers (including their deprecated bare aliases).
+var basicAuthPublicPrefixes = []string{"/v1/", "/v1beta/", "/api/pii/"}
+var basicAuthPublicExact = map[string]bool{
+	"/api/health": true, "/api/version": true, "/health": true, "/version": true,
+	"/api/auth/status": true,
+}
+
+// isBasicAuthPublicPath reports whether p is exempt from Basic Auth.
+func isBasicAuthPublicPath(p string) bool {
+	if basicAuthPublicExact[p] {
+		return true
+	}
+	for _, prefix := range basicAuthPublicPrefixes {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTransparentAdminProtectedPath reports whether p is an admin/data endpoint
+// served by the transparent proxy that must require Basic Auth. It is the set of
+// admin cases in startTransparentProxy's router minus the always-open
+// health/version probes and the /api/pii/* endpoints (handled via the default
+// pass-through and isBasicAuthPublicPath on the main server).
+func isTransparentAdminProtectedPath(p string) bool {
+	switch p {
+	case "/api/logs", "/logs",
+		"/api/mappings", "/mappings",
+		"/api/stats", "/stats",
+		"/api/dashboard",
+		"/api/model/security",
+		"/api/proxy/ca-cert":
+		return true
+	}
+	return false
+}
+
+// validBasicAuth compares the request's Basic Auth credentials against the
+// configured ones in constant time (sha256 first so differing lengths don't leak
+// via timing).
+func (s *Server) validBasicAuth(r *http.Request) bool {
+	user, pass, ok := r.BasicAuth()
+	if !ok {
+		return false
+	}
+	wantUser := sha256.Sum256([]byte(s.config.BasicAuth.Username))
+	wantPass := sha256.Sum256([]byte(s.config.BasicAuth.Password))
+	gotUser := sha256.Sum256([]byte(user))
+	gotPass := sha256.Sum256([]byte(pass))
+	return subtle.ConstantTimeCompare(gotUser[:], wantUser[:]) == 1 &&
+		subtle.ConstantTimeCompare(gotPass[:], wantPass[:]) == 1
+}
+
+// writeBasicAuthChallenge sends a 401 with a WWW-Authenticate header so browsers
+// prompt for credentials.
+func writeBasicAuthChallenge(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="Kiji Privacy Proxy", charset="UTF-8"`)
+	http.Error(w, "Unauthorized", http.StatusUnauthorized)
+}
+
+// basicAuthMiddleware guards every request EXCEPT the public proxy/health/pii
+// paths (default-deny). It wraps the main mux, whose only non-admin routes are the
+// provider proxy subpaths, so the UI ("/") and the /api/* admin endpoints end up
+// protected.
+func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isBasicAuthPublicPath(r.URL.Path) || s.validBasicAuth(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		writeBasicAuthChallenge(w)
+	})
 }
 
 // noCacheMiddleware adds headers to prevent caching and logs requests

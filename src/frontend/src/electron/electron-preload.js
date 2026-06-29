@@ -124,23 +124,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return await ipcRenderer.invoke("set-welcome-dismissed", dismissed);
   },
 
-  // Listen for tour menu command
-  onTourOpen: (callback) => {
-    ipcRenderer.on("open-tour", callback);
+  // Get admin flag
+  getAdmin: async () => {
+    return await ipcRenderer.invoke("get-admin");
   },
 
-  // Remove tour listener
-  removeTourListener: () => {
-    ipcRenderer.removeAllListeners("open-tour");
-  },
-
-  // Tour completed flag
-  getTourCompleted: async () => {
-    return await ipcRenderer.invoke("get-tour-completed");
-  },
-
-  setTourCompleted: async (completed) => {
-    return await ipcRenderer.invoke("set-tour-completed", completed);
+  // Set admin flag
+  setAdmin: async (admin) => {
+    return await ipcRenderer.invoke("set-admin", admin);
   },
 
   // Model directory management

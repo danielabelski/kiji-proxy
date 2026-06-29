@@ -420,12 +420,7 @@ const registerIpcHandlers = ({
     booleanField
   );
 
-  defineConfigField(
-    "tourCompleted",
-    "get-tour-completed",
-    "set-tour-completed",
-    booleanField
-  );
+  defineConfigField("admin", "get-admin", "set-admin", booleanField);
 
   // ---- Model directory management ----
 

@@ -13,10 +13,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
 	"github.com/dataiku/kiji-proxy/src/backend/config"
+	"github.com/dataiku/kiji-proxy/src/backend/metrics"
 	piiServices "github.com/dataiku/kiji-proxy/src/backend/pii"
 	pii "github.com/dataiku/kiji-proxy/src/backend/pii/detectors"
 	"github.com/dataiku/kiji-proxy/src/backend/processor"
@@ -38,6 +40,13 @@ type Handler struct {
 	loggingDB         piiServices.LoggingDB    // Database or in-memory storage for logging
 	mappingDB         piiServices.PIIMappingDB // Same instance as loggingDB, for mapping operations
 	piiMapping        *piiServices.PIIMapping  // Cache+DB wrapper; used for cache-consistent clear/delete
+	metrics           *metrics.Collector       // In-memory dashboard aggregates (GET /api/dashboard)
+}
+
+// Metrics returns the dashboard metrics collector (may be non-nil for the
+// lifetime of the handler). Used by the server's /api/dashboard endpoint.
+func (h *Handler) Metrics() *metrics.Collector {
+	return h.metrics
 }
 
 // ReloadModel reloads the PII model from the specified directory
@@ -54,6 +63,16 @@ func (h *Handler) IsModelHealthy() bool {
 		return false
 	}
 	return h.modelManager.IsHealthy()
+}
+
+// ModelIdentity returns the signature and short hash of the currently-loaded PII
+// model. It returns the default signature with an empty hash when no model
+// manager is configured.
+func (h *Handler) ModelIdentity() (signature, hash string) {
+	if h.modelManager == nil {
+		return "onnx-pii", ""
+	}
+	return h.modelManager.GetModelIdentity()
 }
 
 // GetModelError returns the last model error (if any)
@@ -201,7 +220,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to process request", http.StatusInternalServerError)
 		return
 	}
-	log.Printf("[Timing] Request PII processing: %v", time.Since(processStart))
+	requestMaskTime := time.Since(processStart)
+	log.Printf("[Timing] Request PII processing: %v", requestMaskTime)
 
 	// Create and send proxy request with redacted body
 	proxyStart := time.Now()
@@ -227,7 +247,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Process response through shared PII pipeline
 	responseProcessStart := time.Now()
 	modifiedBody := h.ProcessResponseBody(r.Context(), respBody, resp.Header.Get("Content-Type"), processed.MaskedToOriginal, processed.TransactionID, provider)
-	log.Printf("[Timing] Response PII restoration: %v", time.Since(responseProcessStart))
+	responseRestoreTime := time.Since(responseProcessStart)
+	log.Printf("[Timing] Response PII restoration: %v", responseRestoreTime)
 
 	// If details are requested, enhance response with PII metadata
 	if includeDetails && resp.StatusCode == http.StatusOK {
@@ -335,6 +356,171 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	totalTime := time.Since(startTime)
 	log.Printf("[Timing] TOTAL ServeHTTP duration: %v", totalTime)
 	log.Printf("Proxied %s %s - Status: %d", r.Method, r.URL.Path, resp.StatusCode)
+
+	// Record dashboard metrics. The recorded latency is the proxy's *added*
+	// overhead — masking the request plus restoring the response — not the full
+	// round trip, which is dominated by the upstream LLM call and would swamp it.
+	// Privacy-safe by construction: only entity labels, confidences, and an
+	// already-masked preview leave this scope — never the original PII text.
+	h.recordMetrics(provider, processed, sourceFromRequest(r), requestMaskTime+responseRestoreTime, resp.StatusCode)
+}
+
+// recordMetrics folds a processed-and-forwarded request into the in-memory
+// dashboard metrics. Shared by the API handler (ServeHTTP) and the transparent
+// proxy so that every proxied request — not just Playground traffic — is
+// counted. Privacy-safe: only entity labels, confidences, and an already-masked
+// preview are recorded, never the original PII.
+func (h *Handler) recordMetrics(provider *providers.Provider, processed *ProcessedRequest, source string, latency time.Duration, statusCode int) {
+	if h.metrics == nil || processed == nil || provider == nil {
+		return
+	}
+	types := make([]string, 0, len(processed.Entities))
+	confs := make([]float64, 0, len(processed.Entities))
+	for _, e := range processed.Entities {
+		if len(e.Text) <= 2 { // skip tokenizer artifacts (same rule as the details path)
+			continue
+		}
+		types = append(types, e.Label)
+		confs = append(confs, e.Confidence)
+	}
+	h.metrics.RecordRequest(metrics.RequestSample{
+		Provider:    string((*provider).GetType()),
+		Source:      source,
+		Types:       types,
+		Confidences: confs,
+		LatencyMS:   int(latency.Milliseconds()),
+		StatusCode:  statusCode,
+		Preview:     h.maskedPreview(processed.RedactedBody, provider),
+	})
+}
+
+// sourceFromRequest derives a best-effort originating-app label from request
+// headers for the dashboard feed. Never contains PII.
+func sourceFromRequest(r *http.Request) string {
+	if v := strings.TrimSpace(r.Header.Get("X-Kiji-Source")); v != "" {
+		return truncatePreview(v, 40)
+	}
+	if ua := strings.TrimSpace(r.Header.Get("User-Agent")); ua != "" {
+		// Keep only the leading product token, e.g. "ClaudeDesktop/1.2" -> "ClaudeDesktop".
+		if i := strings.IndexAny(ua, "/ "); i > 0 {
+			ua = ua[:i]
+		}
+		return truncatePreview(ua, 40)
+	}
+	return "Unknown"
+}
+
+// maskedPreview extracts a short, already-masked descriptor from the redacted
+// (PII-free) request body. Returns "" if nothing can be extracted.
+func (h *Handler) maskedPreview(redactedBody []byte, provider *providers.Provider) string {
+	var data map[string]interface{}
+	if err := json.Unmarshal(redactedBody, &data); err != nil {
+		return ""
+	}
+	text, _ := (*provider).ExtractRequestText(data)
+	text = strings.TrimSpace(strings.ReplaceAll(text, "\n", " "))
+	return truncatePreview(text, 48)
+}
+
+func truncatePreview(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	// Slice at a rune boundary so multibyte (emoji/CJK) text isn't split into
+	// invalid UTF-8. Back off from n bytes until we land on a valid boundary.
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return strings.TrimSpace(s[:cut]) + "…"
+}
+
+// metricsSeedSource is implemented by logging stores that can replay past
+// requests for dashboard seeding. It's optional: if the store doesn't implement
+// it, seeding is simply skipped.
+type metricsSeedSource interface {
+	MetricsSeedRows(ctx context.Context, limit int) ([]piiServices.MetricsSeedRow, error)
+}
+
+// seedMetricsFromLogs replays persisted request logs into the in-memory metrics
+// collector so the dashboard reflects history (and survives restarts) instead of
+// starting from zero each boot. Best-effort and privacy-safe: only entity types,
+// confidences, and timestamps are used — never original PII. Latency is left
+// unknown for seeded rows (the logs don't capture masking time); the live proxy
+// path records the added overhead for requests served after startup.
+func (h *Handler) seedMetricsFromLogs() {
+	if h.metrics == nil {
+		return
+	}
+	src, ok := h.loggingDB.(metricsSeedSource)
+	if !ok {
+		return // logging store doesn't support seeding
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	rows, err := src.MetricsSeedRows(ctx, piiServices.DefaultMaxLogEntries)
+	if err != nil {
+		log.Printf("[Metrics] ⚠️  Failed to seed metrics from logs: %v", err)
+		return
+	}
+
+	// Rows come newest-first; replay oldest→newest so ordering-sensitive
+	// aggregates (recent feed, per-minute peak) end up chronological.
+	for i := len(rows) - 1; i >= 0; i-- {
+		row := rows[i]
+		h.metrics.RecordRequest(metrics.RequestSample{
+			Provider:    providerFromModel(row.Model),
+			Types:       row.Types,
+			Confidences: row.Confidences,
+			LatencyMS:   0, // unknown for historical requests; excluded from latency stats
+			At:          row.Timestamp,
+		})
+	}
+	log.Printf("[Metrics] Seeded dashboard metrics from %d logged requests", len(rows))
+}
+
+// dashboardWindowSource is implemented by logging stores that can return the
+// per-request projections the dashboard aggregates directly from SQLite. It's
+// optional: stores that don't implement it fall back to the in-memory collector.
+type dashboardWindowSource interface {
+	DashboardWindowRows(ctx context.Context, since time.Time) ([]piiServices.MetricsSeedRow, error)
+}
+
+// DashboardWindowRows returns proxied-request projections at or after `since`
+// (a zero `since` returns all history) for SQLite-backed dashboard aggregation.
+// Returns nil, nil when no logging store is configured or it doesn't support the
+// query, so the dashboard handler can fall back to the in-memory collector.
+func (h *Handler) DashboardWindowRows(ctx context.Context, since time.Time) ([]piiServices.MetricsSeedRow, error) {
+	if h.loggingDB == nil {
+		return nil, nil
+	}
+	src, ok := h.loggingDB.(dashboardWindowSource)
+	if !ok {
+		return nil, nil
+	}
+	return src.DashboardWindowRows(ctx, since)
+}
+
+// providerFromModel makes a best-effort provider guess from a logged model name
+// (the logs don't store the provider explicitly). Returns "" when unknown, in
+// which case the request still counts but isn't attributed to a provider.
+func providerFromModel(model string) string {
+	m := strings.ToLower(model)
+	switch {
+	case strings.Contains(m, "claude"):
+		return "anthropic"
+	case strings.Contains(m, "gemini"):
+		return "gemini"
+	case strings.Contains(m, "mistral"), strings.Contains(m, "mixtral"):
+		return "mistral"
+	case strings.Contains(m, "gpt"), strings.Contains(m, "davinci"),
+		strings.HasPrefix(m, "o1"), strings.HasPrefix(m, "o3"), strings.HasPrefix(m, "o4"):
+		return "openai"
+	default:
+		return ""
+	}
 }
 
 // readRequestBody reads the request body
@@ -801,7 +987,7 @@ func NewHandler(cfg *config.Config) (*Handler, error) {
 		},
 	}
 
-	return &Handler{
+	h := &Handler{
 		client:            client,
 		config:            cfg,
 		modelManager:      modelManager,
@@ -813,7 +999,15 @@ func NewHandler(cfg *config.Config) (*Handler, error) {
 		loggingDB:         loggingDB,
 		mappingDB:         loggingDB.(piiServices.PIIMappingDB), // Same instance, different interface
 		piiMapping:        piiMapping,
-	}, nil
+		metrics:           metrics.New(),
+	}
+
+	// Backfill dashboard metrics from persisted logs so the dashboard reflects
+	// history and survives restarts. Runs in the background to avoid delaying
+	// startup; the collector is concurrency-safe.
+	go h.seedMetricsFromLogs()
+
+	return h, nil
 }
 
 // createMaskedRequest creates a masked version of the request by detecting and masking PII in messages

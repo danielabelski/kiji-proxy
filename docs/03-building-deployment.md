@@ -24,15 +24,16 @@ Kiji Privacy Proxy can be built for two platforms with different deployment mode
 - **User Interface:** Desktop application with web UI
 
 ### Linux (Standalone Binary)
-- **Format:** API server binary (no UI)
+- **Format:** Self-contained server binary with embedded web UI
 - **Package:** Tarball (`*.tar.gz`, ~150-200MB) and Debian package
   (`*.deb`, Debian/Ubuntu) with binary and libraries
-- **Components:** Go backend + ML model + libraries
-- **User Interface:** HTTP API only (no web UI)
+- **Components:** Go backend + embedded web UI + ML model + libraries
+- **User Interface:** Web UI served at http://localhost:8080 (browser; no Electron).
+  Set `KIJI_SERVE_UI=false` to run API-only (headless).
 
 Both builds include:
 - Go backend (proxy server + PII detection)
-- Embedded ML model (`model_quantized.onnx`)
+- Embedded ML model (`model/quantized/model.onnx`)
 - Embedded tokenizer files (complete set)
 - ONNX Runtime library
 - Static tokenizers library
@@ -72,7 +73,7 @@ go env CGO_ENABLED  # Should be 1
 
 # Pull model files
 git lfs pull
-ls -lh model/quantized/model_quantized.onnx  # Should be ~63MB
+ls -lh model/quantized/model.onnx  # Should be a real model file, not a small LFS pointer
 ```
 
 ## Build Architecture
@@ -112,11 +113,12 @@ ls -lh model/quantized/model_quantized.onnx  # Should be ~63MB
 ├─────────────────────────────────────────┤
 │  bin/kiji-proxy                          │
 │    ├── Backend API Server               │
+│    ├── Embedded Web UI                  │
 │    ├── Embedded ML Model                │
 │    ├── Embedded Tokenizers              │
 │    ├── Proxy Server                     │
 │    └── PII Detection Engine            │
-│    (NO WEB UI - API only)               │
+│    (Web UI on :8080)                    │
 │                                          │
 │  lib/libonnxruntime.so.1.24.2           │
 │                                          │
@@ -322,13 +324,21 @@ cd ..
 **3. Prepare Embedded Files:**
 
 ```bash
+# Build the web UI (plain web build, not :electron) and stage it for embedding.
+# Go //go:embed cannot reach ../, so the assets must live under src/backend/.
+(cd src/frontend && npm ci && npm run build)
+rm -rf src/backend/frontend/dist
+mkdir -p src/backend/frontend/dist
+cp -r src/frontend/dist/* src/backend/frontend/dist/
+
 # Copy model files (ONNX model + all tokenizer files)
 rm -rf src/backend/model/quantized
 mkdir -p src/backend/model
 cp -r model/quantized src/backend/model/
 ```
 
-**Note:** No frontend build for Linux - it's API-only!
+**Note:** The Linux binary embeds and serves the web UI at http://localhost:8080.
+Set `KIJI_SERVE_UI=false` to run API-only (headless).
 
 **4. Build Go Binary:**
 
@@ -465,8 +475,8 @@ cd kiji-privacy-proxy-*-linux-amd64
 ./run.sh
 
 # Test endpoints
-curl http://localhost:8080/health
-curl http://localhost:8080/version
+curl http://localhost:8080/api/health
+curl http://localhost:8080/api/version
 ```
 
 ## Build Optimizations
@@ -490,8 +500,8 @@ go build -ldflags="-s -w" -o kiji-proxy ./src/backend
 
 The build uses a quantized model for smaller size:
 
-- **Original:** `model.onnx` (249MB)
-- **Quantized:** `model_quantized.onnx` (63MB)
+- **Original:** `model/trained/model.onnx` (249MB)
+- **Quantized:** `model/quantized/model.onnx` (63MB)
 - **Savings:** 186MB (75% reduction)
 
 ### DMG Compression
@@ -558,7 +568,7 @@ sudo systemctl start kiji-proxy
 ```bash
 sudo systemctl status kiji-proxy
 sudo journalctl -u kiji-proxy -f
-curl http://localhost:8080/health
+curl http://localhost:8080/api/health
 ```
 
 ### Systemd Service Configuration
@@ -584,6 +594,31 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 ```
+
+### Protecting the UI (HTTP Basic Auth)
+
+On a server the web UI exposes the dashboard, PII **mappings**, logs, and settings,
+so you usually want it admin-only. Set a username and password and the proxy guards
+the UI and admin API with HTTP Basic Auth:
+
+```bash
+# add to /etc/kiji-proxy.env
+KIJI_BASIC_AUTH_USERNAME=admin
+KIJI_BASIC_AUTH_PASSWORD=change-me
+# KIJI_BASIC_AUTH_ENABLED=false   # kill switch: force auth off even if creds are set
+```
+
+- **Auth turns on automatically** once **both** `KIJI_BASIC_AUTH_USERNAME` and
+  `KIJI_BASIC_AUTH_PASSWORD` are set. With neither set (the default) the UI is
+  unprotected, so the desktop build and existing setups are unaffected.
+- **Protected** (require credentials): the UI (`/`) and the admin/data endpoints
+  `/api/mappings`, `/api/dashboard`, `/api/logs`, `/api/stats`, `/api/model/*`,
+  `/api/proxy/*`.
+- **Always open** (never challenged): the LLM proxy routes `/v1/*` and `/v1beta/*`
+  (so API clients with their own keys keep working), all `/api/pii/*` endpoints, and
+  `/api/health` / `/api/version` (for load-balancer probes).
+- Set `KIJI_BASIC_AUTH_ENABLED=false` to disable auth even when credentials are
+  present (only the literal `true` keeps it on).
 
 ### Docker Deployment
 
@@ -639,8 +674,8 @@ open "/Applications/Kiji Privacy Proxy.app"
 
 ```bash
 # Check size
-ls -lh model/quantized/model_quantized.onnx
-# Should be ~63MB, not a few hundred bytes
+ls -lh model/quantized/model.onnx
+# Should be a real model file, not a few hundred bytes (an unfetched LFS pointer)
 
 # Solution: Pull LFS files
 git lfs pull
@@ -760,7 +795,7 @@ sudo ldconfig
 | libonnxruntime (macOS) | 26MB | Dynamic library |
 | libonnxruntime (Linux) | 24MB | Shared library |
 | libtokenizers.a | 15MB | Static (in binary) |
-| model_quantized.onnx | 63MB | ML model |
+| model/quantized/model.onnx | 63MB | ML model |
 | Frontend dist | 2-5MB | React bundle |
 | **Total DMG** | **~400MB** | macOS package |
 | **Total Tarball** | **~150-200MB** | Linux package |

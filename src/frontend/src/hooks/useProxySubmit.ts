@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback } from "react";
 import type {
   ProviderType,
   DetectedEntity,
@@ -40,8 +40,6 @@ interface UseProxySubmitOptions {
   };
   apiKey: string | null;
   isElectron: boolean;
-  isTourActive: () => boolean;
-  cancelTour: () => void;
 }
 
 export function useProxySubmit({
@@ -49,8 +47,6 @@ export function useProxySubmit({
   providersConfig,
   apiKey,
   isElectron,
-  isTourActive,
-  cancelTour,
 }: UseProxySubmitOptions) {
   const [inputData, setInputData] = useState("");
   const [maskedInput, setMaskedInput] = useState("");
@@ -63,13 +59,6 @@ export function useProxySubmit({
   const [detectedEntities, setDetectedEntities] = useState<DetectedEntity[]>(
     []
   );
-
-  // Cancel tour if processing starts
-  useEffect(() => {
-    if (isProcessing && isTourActive()) {
-      cancelTour();
-    }
-  }, [isProcessing, isTourActive, cancelTour]);
 
   const averageConfidence = useMemo(() => {
     if (detectedEntities.length === 0) return 0;
@@ -95,7 +84,7 @@ export function useProxySubmit({
       highlightEntitiesByToken(
         truncateForHighlighting(maskedInput),
         detectedEntities,
-        "bg-green-200 text-green-900 font-bold"
+        "bg-amber-200 text-amber-900 font-bold"
       ),
     [maskedInput, detectedEntities]
   );
@@ -105,7 +94,7 @@ export function useProxySubmit({
       highlightEntitiesByToken(
         truncateForHighlighting(maskedOutput),
         detectedEntities,
-        "bg-purple-200 text-purple-900 font-bold"
+        "bg-amber-200 text-amber-900 font-bold"
       ),
     [maskedOutput, detectedEntities]
   );
@@ -115,7 +104,7 @@ export function useProxySubmit({
       highlightEntitiesByOriginal(
         truncateForHighlighting(finalOutput),
         detectedEntities,
-        "bg-blue-200 text-blue-900 font-bold"
+        "bg-brand-200 text-brand-900 font-bold"
       ),
     [finalOutput, detectedEntities]
   );
@@ -164,6 +153,10 @@ export function useProxySubmit({
       if (isElectron && apiKey) {
         headers = buildHeaders(activeProvider, apiKey);
       }
+
+      // Identify the originating app for the dashboard activity feed. Set after
+      // buildHeaders so it survives whichever header-construction branch ran.
+      headers["X-Kiji-Source"] = "Kiji Playground";
 
       const response = await fetch(apiUrl, {
         method: "POST",
