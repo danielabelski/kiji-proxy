@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/dataiku/kiji-proxy/src/backend/providers"
 )
 
 func TestValidatePort(t *testing.T) {
@@ -352,6 +354,49 @@ func TestValidateConfig(t *testing.T) {
 // Helper function to check for string containment in error messages
 func stringContains(s, substr string) bool {
 	return strings.Contains(s, substr)
+}
+
+// chatgpt.com is the ChatGPT-login Codex host; it must be intercepted whenever
+// the OpenAI provider is configured, and only then.
+func TestGetInterceptDomains_CodexHost(t *testing.T) {
+	pc := DefaultConfig().Providers
+	found := false
+	for _, d := range pc.GetInterceptDomains() {
+		if d == "chatgpt.com" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("GetInterceptDomains() = %v, want it to include chatgpt.com when OpenAI is configured", pc.GetInterceptDomains())
+	}
+
+	pc.OpenAIProviderConfig.APIDomain = ""
+	for _, d := range pc.GetInterceptDomains() {
+		if d == "chatgpt.com" {
+			t.Error("chatgpt.com intercepted even though OpenAI provider is disabled")
+		}
+	}
+}
+
+// Only the Codex completions path on chatgpt.com should be masked; the host's
+// other endpoints (MCP transport, telemetry) must pass through. Hosts other
+// than chatgpt.com carry no allowlist (all paths intercepted).
+func TestGetInterceptPathPrefixes(t *testing.T) {
+	pc := DefaultConfig().Providers
+
+	prefixes := pc.GetInterceptPathPrefixes()
+	want := []string{providers.ProviderSubpathCodexResponses}
+	if got := prefixes[providers.ProviderAPIDomainCodex]; !reflect.DeepEqual(got, want) {
+		t.Errorf("GetInterceptPathPrefixes()[chatgpt.com] = %v, want %v", got, want)
+	}
+	if len(prefixes) != 1 {
+		t.Errorf("GetInterceptPathPrefixes() has %d entries, want only chatgpt.com: %v", len(prefixes), prefixes)
+	}
+
+	pc.OpenAIProviderConfig.APIDomain = ""
+	if prefixes := pc.GetInterceptPathPrefixes(); len(prefixes) != 0 {
+		t.Errorf("GetInterceptPathPrefixes() = %v with OpenAI disabled, want empty", prefixes)
+	}
 }
 
 func TestDefaultConfig_Detectors(t *testing.T) {
