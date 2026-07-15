@@ -112,6 +112,11 @@
       "experimentalLabel": "Experimental:",
       "experimentalHelp": "This feature requires CA certificate installation and may affect system network settings."
     },
+    "telemetry": {
+      "label": "Crash & Error Reporting",
+      "help": "Off by default. When enabled, anonymous crash and error reports are sent to help improve Kiji. Your prompts and the original (unmasked) text are never sent — only masked text and technical error details. Enabling this also lets you submit PII misclassification reports.",
+      "restartNotice": "Restart the app for this change to fully take effect across all components."
+    },
     "model": {
       "label": "Load Custom Kiji PII Model",
       "statusHealthy": "Healthy",

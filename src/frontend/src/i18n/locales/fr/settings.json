@@ -112,6 +112,11 @@
       "experimentalLabel": "Expérimental :",
       "experimentalHelp": "Cette fonctionnalité nécessite l'installation d'un certificat racine et peut affecter les paramètres réseau du système."
     },
+    "telemetry": {
+      "label": "Rapports de plantage et d'erreur",
+      "help": "Désactivé par défaut. Lorsque cette option est activée, des rapports anonymes de plantage et d'erreur sont envoyés pour aider à améliorer Kiji. Vos requêtes et le texte original (non masqué) ne sont jamais envoyés — uniquement le texte masqué et des détails techniques sur l'erreur. L'activation vous permet également de signaler des erreurs de classification des renseignements personnels.",
+      "restartNotice": "Redémarrez l'application pour que ce changement prenne pleinement effet dans tous les composants."
+    },
     "model": {
       "label": "Charger un modèle de détection Kiji personnalisé",
       "statusHealthy": "Opérationnel",

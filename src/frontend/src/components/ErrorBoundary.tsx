@@ -1,5 +1,6 @@
 import { Component, ErrorInfo, ReactNode } from "react";
 import { AlertCircle, RefreshCw } from "lucide-react";
+import { reportError } from "../utils/misclassificationReporter";
 import { withTranslation, WithTranslation } from "react-i18next";
 
 interface Props extends WithTranslation {
@@ -38,8 +39,9 @@ class ErrorBoundary extends Component<Props, State> {
       errorInfo,
     });
 
-    // In a production app, you might want to log this to an error reporting service
-    // e.g., Sentry, LogRocket, etc.
+    // Forward to Sentry. This is a no-op when telemetry is disabled (opt-in),
+    // so no data leaves the machine unless the user turned reporting on.
+    reportError(error, { componentStack: errorInfo.componentStack });
   }
 
   handleReset = (): void => {
